@@ -1,0 +1,507 @@
+---
+title: "Práctica 2 - Sensores"
+author: "Adrián Cidre González"
+date:  "`r format(Sys.time(), '%d %B, %Y')`"
+
+# Format options
+lang: es
+page-layout: full
+format: 
+  html:
+    toc: true
+    toc-location: left
+    toc-title: 'Contenidos'
+    css: './styles/style.css'
+    theme: lux
+    highlight-style: zenburn
+  
+# Code
+code-copy: hover
+code-fold: true
+execute: 
+  warning: false
+
+# References
+bibliography: './styles/biblio.bib'
+crossref: 
+  fig-title: Fig.
+
+# Figures and tables
+fig-align: 'center'
+fig-width: 14
+fig-height: 8
+fig-cap-location: bottom
+tbl-cap-location: top
+---
+
+![](styles/satellite.jpg){fig-align="center"}
+
+## Introducción
+
+En el presente ejercicio se realiza una fusión de imágenes de las bandas multiespectrales y la banda pancromática de una imagen Landsat 9 mediante el método de fusión *A Trous* (método manual *pansharpen*).
+
+Los objetivos de esta tarea son:
+
+-   Visualización y ajuste de contraste (comparar la información multiespectral original y la obtenida con la imagen fusionada).
+
+-   Cambio de tamaño de píxel.
+
+-   Obtención precisa de estadísticas.
+
+-   Filtrado.
+
+-   Operaciones matemáticas entre bandas.
+
+En las siguientes secciones se explica la metodología y herramienta utilizada para resolver este ejercicio, y se explica detalladamente los pasos utilizados para realizar el método de fusión *A Trous*.
+
+<br>
+
+## Material y Software
+
+Para realizar este ejercicio se ha utilizado el lenguaje R [@R], utilizando los paquetes del siguiente bloque de código:
+
+```{r paquetes}
+#| code-summary: Código paquetes
+require(pacman)
+
+p_load(here, terra, tidyverse, mapview, sf, geodata, raster, flextable)
+```
+
+El material de trabajo es una imagen *USGS Landsat 9 Level 1, Collection 2, Tier 1*, que abarca prácticamente toda Galicia. Para este ejercicio se utilizarán las bandas 1 hasta la 8, y un recorte a la extensión del ayuntamiento de Folgoso do Courel. En la [Fig. @fig-band1] se ve la localización utilizando la Banda 1.
+
+```{r leerBandas}
+#| code-summary: Código datos de trabajo
+# Cargar las bandas 1 a 7 en un stack
+bandFiles <- list.files(path = here('inputs'),
+                        pattern = 'B[1-7].TIF',
+                        full.names = TRUE)
+
+bandsMulti <- map(bandFiles, rast)
+
+# Cargar banda pancromática
+bandPan <- rast(here('inputs/LC09_L1TP_204030_20220909_20220909_02_T1_B8.TIF'))
+
+# Leer datos Folgoso do Courel
+spain <- gadm(country = 'ESP',
+              level = 4,
+              path = here('inputs/'),
+              resolution = 2)
+
+aoi <- spain |> 
+  st_as_sf() |> 
+  filter(NAME_4 == 'Folgoso do Courel') |> 
+  st_transform(32629)
+
+# Recortar al área de estudio
+bandsMulti <- map(bandsMulti, crop, aoi)
+bandPan <- crop(bandPan, aoi)
+```
+
+Por conveniencia se trabajará durante todo el ejercicio con listas de *SpatRasters* en vez de un solo *SpatRaster* con estructura de *brick*.
+
+```{r}
+#| label: fig-band1
+#| fig-height: 12
+#| fig-cap: Representación de la banda 1
+#| echo: false
+#| code-summary: Código Webmap
+palGray <- gray(seq(0, 1, length.out = 10))
+mapview(raster(bandsMulti[[1]]),
+        col.regions = palGray,
+        layer.name = 'Banda 1',
+        na.color = NA)
+```
+
+<br>
+
+También podemos ver en la [Fig. @fig-comparacion] una comparación del tamaño de píxel de la imagen pancromática y la banda 2 en una pequeña extensión del área de estudio donde se encuentra parte de una cantera.
+
+```{r}
+#| fig-cap: Comparación de (a) resolución de la banda pancromática; y (b) resolución de la banda 2
+#| label: fig-comparacion
+#| echo: false
+
+extSample <- ext(c(650000, 653000, 4712000, 4715000))
+
+par(mfrow = c(1,2))
+plot(bandPan, ext = extSample, main = 'a) Banda pancromática', col = palGray, cex.main = 1.5)
+plot(bandsMulti[[2]], ext = extSample, main = 'b) Banda 2', col = palGray, cex.main = 1.5)
+```
+
+<br>
+
+## Fusión
+
+El principal objetivo de la fusión es mejorar la resolución espacial de las bandas de una imagen, utilizando la resolución de una banda pancromática. Esta banda pancromática en Landsat tiene una resolución espacial de 15 m, mientras que el resto de bandas tienen una resolución espacial de 30 m. Mediante la fusión, o más específicamente el *pansharpening*, conseguimos que todas las bandas que están a una resolución de 30 m pasen a tener la resolución espacial de la banda pancromática. Existen varios métodos para hacerlo, pero en este ejercicio se utilizó el método **A Trous**. Los pasos para realizar este método son los siguientes:
+
+-   Remuestrear la imagen multiespectral
+
+-   Comprobación de prerrequisitos geométricos
+
+-   Matcheado de la imagen
+
+-   Obtención del detalle mediante filtros wavelet
+
+-   Obtención de la imagen fusionada
+
+Los diferentes pasos se detallan en el siguiente *tabset*:
+
+::: panel-tabset
+## Remuestero
+
+Este primer paso consiste en igualar la resolución espacial de la imagen multiespectral, al tamaño de la banda pancromática. En el siguiente bloque de código se puede ver el procedimiento:
+
+```{r}
+#| code-summary: Código remuestreo
+bandsMulti_Resampled <- map(bandsMulti, resample, bandPan)
+```
+
+## Prerrequisitos
+
+Este paso consiste en comprobar que las especificaciones de la imagen multiespectral coinciden con las de la banda pancromática. Esto quiere decir que tengan la misma extensión, SRC, número de filas y número de columnas.
+
+Para ello podemos simplemente llamar a ambos objetos y comprobar las características *dimensions, resolution, extent* y *coord.ref.*. La tercera dimensión es obviamente diferente ya que la imagen multiespectral contiene 7 bandas.
+
+```{r}
+#| code-summary: Imagen multiespectral
+rast(bandsMulti_Resampled)
+```
+
+```{r}
+#| code-summary: Banda pancromática
+bandPan
+```
+
+## Matcheado de la imagen
+
+En este paso se busca ajustar el histograma de la banda pancromática a las características espectrales de cada una de las bandas que queremos fusionar. Esto se realiza para evitar que una variabilidad en la espectralidad de las bandas de la imagen multiespectral.
+
+Para ello, se utiliza la @eq-matcheado para calcular $Pan_{x_{i}}$, que es el histograma de la imagen pancromática igualado al de cada una de las $i$ bandas.
+
+$$
+Pan_{x_{i}} = a_i \times Pan + b_i
+$$ {#eq-matcheado}
+
+donde
+
+$$
+a_i = \frac{\sigma_{x_i}}{\sigma_{Pan}} \\[1cm] 
+$$ {#eq-mat2}
+
+$$
+b_i = \overline{X_i} - (\frac{\sigma_{x_i}}{\sigma_{Pan}} \times \overline{Pan})
+$$ {#eq-mat3}
+
+siendo $\sigma$ la desviación típica de las bandas $x_i$ y $Pan$; y siendo $overline{X_i}$ y $\overline{Pan}$ las respectivas medias.
+
+```{r}
+#| code-summary: Código Matcheado
+# Valores media y sd de banda pancromática
+mean_pan <- global(bandPan, mean)[,1]
+sd_pan <- global(bandPan, sd)[,1]
+
+# Función para obtener la media y la sd de cada banda
+matchPan <- function(band){
+  
+  # Obtener los valores de la banda i
+  mean_band <- global(band, mean)[,1]
+  sd_band <- global(band, sd)[,1]
+  
+  # Calcular la ecuación 2
+  ai <- sd_band / sd_pan
+  
+  # Calcular la ecuación 3
+  bi <- mean_band - (ai * mean_pan)
+  
+  # Calcular la ecuación 1
+  pan_xi <- ai * bandPan + bi
+  
+  # Devolver resultado
+  return(pan_xi)
+}
+
+# Mapear la función a cada una de las bandas
+matched_pan <- map(bandsMulti_Resampled, matchPan)
+```
+
+Podemos ver si los valores de media y desviación estándar del resultado se adecúan a los valores de las bandas originales a través del siguiente código, obteniendo el resultado de la [Tabla @tbl-comp].
+
+```{r}
+#| code-summary: Código datos Tabla 1
+tab <- data.frame(
+  Banda = paste0('B',1:7),
+  Media_original = map_df(bandsMulti_Resampled, global, mean)[,1] |> round(),
+  Media_matcheado = map_df(matched_pan, global, mean)[,1] |> round(),
+  Sd_original = map_df(bandsMulti_Resampled, global, sd)[,1] |> round(),
+  Sd_matcheado = map_df(matched_pan, global, sd)[,1] |> round()
+)
+```
+
+```{r}
+#| echo: false
+#| tbl-cap: Comparación de media y desviación estándar de la imagen original y la matcheada.
+#| label: tbl-comp
+flextable(tab)
+```
+
+## Filtros wavelet
+
+A continuación, se va a aplicar un filtro de paso bajo a cada una de las bandas matcheadas en el paso anterior. En este caso solamente se necesita realizar un filtro para pasar de 30m a 15m (ratio 2:1). En R podemos utilizar la función `terra::focal()` propocionado la *moving window*, que será la matriz de filtrado. En este caso se ha elegido el filtro siguiente:
+
+<center>
+
+```{r}
+#| echo: false
+mat <- matrix(c(1,1,1,
+                1,2,1,
+                1,1,1),
+              ncol = 3)
+prmatrix(mat, rowlab=rep("",3), collab=rep("",3))
+```
+
+</center>
+
+por lo que se da el doble de peso al valor del píxel que se modifica que a los vecinos que le rodean. Esta matriz está guardada en un objeto llamado *mat*, y se aplica a cada una de las 7 bandas obtenidas en el paso anterior, y que se encuentran en el objeto *matched_pan*. El valor del píxel objetivo se obtiene mediante la media de los valores obtenidos en la *moving window*.
+
+```{r}
+#| code-summary: Código Filtro
+
+# Crear función filtro de paso bajo
+lowpassFilter <- function(band){
+  lpf <- focal(band,
+               filter = mat,
+               fun = mean)
+  return(lpf)
+}
+
+# Mapear la función
+filtered_pan <- map(matched_pan, lowpassFilter)
+```
+
+Seguidamente se muestra una comparación de la banda pancromática original y una de las bandas filtradas [Fig. @fig-filter]. Es la filtrada se puede observar como la imagen se homogeniniza, de forma que se obtiene una imagen más suave.
+
+```{r}
+#| label: fig-filter
+#| fig-cap: Comparación de (a) banda pancromática original; y (b) banda 3 filtrada
+#| echo: false
+par(mfrow = c(1,2))
+plot(bandPan, ext = extSample, main = 'a) Banda pancromática', col = palGray, cex.main = 1.5)
+plot(filtered_pan[[3]], ext = extSample, main = 'b) Banda 3 filtrada', col = palGray, cex.main = 1.5)
+```
+
+<br>
+
+El último paso de esta sección, consiste en obtener el **detalle**($D_i$) de cada banda. Para ello se debe utilizar la @eq-detalle, restando la banda $i$ pancromática filtrada ($PF_i$) a la banda $i$ pancromática matcheada $PM_i$.
+
+$$
+D_i  = PM_i - PF_i
+$$ {#eq-detalle}
+
+<br>
+
+```{r}
+#| code-summary: Código Detalle
+# Función para calcular el detalle
+detail <- function(matchBand, filterBand){
+  detail <- matchBand - filterBand
+  return(detail)
+}
+
+# Mapear función
+detalle <- map2(matched_pan, filtered_pan, detail)
+```
+
+De este modo obtenemos el detalle de las 7 bandas. En la [Fig. @fig-detalle] se muestra el resultado de esta función para la banda 4. Se puede ver por un lado como se resaltan los detalles, y por otro que los valores del detalle incluyen positivos y negativos. En este sentido, se ha realizado una comprobación de la validez de este resultado, que consiste en comprobar que la media de cada banda del detalle debe ser aproximadamente igual a 0. En la @tbl-detalle y el bloque de código precedente se muestra esta comprobación.
+
+```{r}
+#| label: fig-detalle
+#| fig-cap: Comparación de (a) banda pancromática 4 matcheada; y (b) detalle de la banda 4 
+#| echo: false
+par(mfrow = c(1,2))
+plot(matched_pan[[4]], ext = extSample, main = 'a) Banda 4 pancromática matcheada ', col = palGray, cex.main = 1.5)
+plot(detalle[[4]], ext = extSample, main = 'b) Banda 4 detalle', col = palGray, cex.main = 1.5)
+```
+
+<br>
+
+```{r}
+#| code-summary: Código datos Tabla 2
+tab2 <- data.frame(
+  Banda = paste0('B',1:7),
+  Media = map_df(detalle, global, mean, na.rm = T)[,1] |> round(2),
+  Sd = map_df(detalle, global, sd, na.rm = T)[,1] |> round(2)
+)
+```
+
+```{r}
+#| echo: false
+#| tbl-cap: Comprobación de la validez de las bandas de detalle. La media debe ser aproximadamente igual a 0
+#| label: tbl-detalle
+flextable(tab2,
+          cwidth = 2) |> 
+  align(align = 'center',
+        part = 'all')
+```
+
+<br>
+
+## Fusión
+
+El último paso es realizar la fusión. Esta consiste en, a cada banda $i$ del detalle obtenido en la sección anterior, sumarle la banda $i$ de la imagen multiespectral remuestreada (*bandsMulti_Resampled*) obtenida en la sección de *Remuestreo*, de acuerdo a la @eq-fusion.
+
+$$
+BF_i = D_i + BR_i
+$$ {#eq-fusion} <br>
+
+Donde $BF_i$ es la banda $i$ fusionada; $D_i$ el detalle de la banda $i$; y $BR_i$ la banda $i$ remuestreada. El siguiente código ejecuta esta operación y en la [Fig. @fig-fusion] podemos ver el resultado, donde [Fig. @fig-fusion]b muestra la imagen en color verdadero a un tamaño de píxel de 15 metros, donde se pueden ver mucho mejor los caminos. Además, se puede ver perfectamente la diferencia entre la cantera, una zona quemada, y una zona con vegetación sin quemar.
+
+```{r}
+#| code-summary: Código fusión
+fusion <- map2(bandsMulti_Resampled, 
+               detalle,
+               function(x, y){return(x + y)})
+```
+
+```{r}
+#| echo: false
+#| label: fig-fusion
+#| fig-cap: Comparación (a) imagen en color real descargada directamente de Landsat-9 con resolución espacial de 30 metros; y (b) imagen en color real fusionada con 15 metros de resolución espacial
+par(mfrow = c(1,2), cex.main = 2)
+plotRGB(rast(bandsMulti), 4, 3, 2, ext = extSample, main = '\n a) Color real 30m', stretch = 'lin')
+plotRGB(rast(fusion), 4, 3, 2, ext = extSample, main = '\n b) Color real 15m', stretch = 'lin')
+```
+
+## Imagen final  
+
+En esta sección se muestra una comparación de la imagen inicial y la imagen fusionada. Se puede ver que en caso de trabajar a esta escala, los cambios entre la [Fig. @fig-entera] y [Fig. @fig-entera2] son casi inapreciables para el ojo humano. No obstante, si trabajásemos a una escala espacial menor como en el ejemplo mostrado anteriormente del zoom alrededor e la cantera, sería una herramienta que nos aportaría calidad a nuestros análisis y resultados.
+
+```{r}
+#| echo: false
+#| label: fig-entera
+#| fig-cap: Imagen de Landsat-9 en color verdadero del incendio de Folgoso do Courel (Galicia) de verano de 2022
+plotRGB(rast(bandsMulti), 4, 3, 2, stretch = 'lin')
+```
+```{r}
+#| echo: false
+#| label: fig-entera2
+#| fig-cap: Imagen de Landsat-9 fusionada en color verdadero del incendio de Folgoso do Courel (Galicia) de verano de 2022
+plotRGB(rast(fusion), 4, 3, 2, stretch = 'lin')
+```
+
+## Extra  
+
+Para facilitar la aplicación de este método, he creado una función a partir de este ejercicio que realiza el método de fusión A Trous para cualquier imagen. Los argumentos son los siguientes:  
+
+* **bands**: (list) bandas que se quieren fusionar como *SpatRaster* dentro de una lista.  
+
+* **panchro**: (SpatRaster) banda pancromática como *SpatRaster*
+
+* **filter**: (matrix, optional) filtro que se quiere aplicar. Por defecto el aplicado en este ejercicio.  
+
+* **scale**: (integer) ratio entre la escala de las bandas que se quieren fusionar y la banda pancromática. Se aplicarán $scale - 1$ filtros. Por defecto para Landsat-9 $30/15=2$.  
+
+```{r}
+#| code-summary: Código función fusión
+fusionL9 <- function(bands, 
+                     panchro, 
+                     filter = matrix(c(1,1,1,1,2,1,1,1,1),
+                                     nrow = 3),
+                     scale = 2){
+  # Resample ----------------------------------
+  resampled <- map(bands, resample, panchro)
+  
+  # Matching ----------------------------------
+  # mean and sd of panchromatic
+  mean_pan <- global(panchro, mean)[,1]
+  sd_pan <- global(panchro, sd)[,1]
+  
+  # Map matching function
+  matched_pan <- map(resampled, function(band){
+    
+    # mean and sd of band i
+    mean_band <- global(band, mean)[,1]
+    sd_band <- global(band, sd)[,1]
+    
+    # Eq2
+    ai <- sd_band / sd_pan
+    # Eq3
+    bi <- mean_band - (ai * mean_pan)
+    # Eq1
+    pan_xi <- ai * panchro + bi
+  
+  # Result of matching
+  return(pan_xi)
+  })
+  
+  # Filter
+  for (i in 2:scale){
+    if (i == 2){
+      filtered_pan <- map(matched_pan, 
+                          function(band){
+                            lpf <- focal(band,
+                                         filter = filter,
+                                         fun = mean)
+                            return(lpf)})
+    } else {
+        filtered_pan <- map(filtered_pan, 
+                          function(band){
+                            lpf <- focal(band,
+                                         filter = filter,
+                                         fun = mean)
+                            return(lpf)})
+    }}
+  
+  # Detail
+  detail <- map2(matched_pan, 
+                 filtered_pan, 
+                 function(matchBand, filterBand){
+                   detail <- matchBand - filterBand
+                   return(detail)
+                   })
+  # Fusion
+  fusion <- map2(resampled, 
+                 detail,
+                 function(x, y){return(x + y)})
+  
+  return(fusion)
+}
+```
+
+Para comprobar su funcionamiento, vamos a recortar una muestra de la imagen inicial:
+
+```{r}
+#| code-summary: Código muestra
+# Extensión
+extSample2 <- ext(c(646000, 651000, 4715000, 4720000))
+
+# Recortar imagen original a la extensión creada
+multiSample <- map(bandsMulti, crop, extSample2)
+panchroSample <- crop(bandPan, extSample2)
+```
+
+A continuación, aplicamos la función creada, y en [Fig. @fig-perso] vemos el resultado, que ha funcionado a la perfección. Cualquiera que copie la función podrá aplicarla a sus imágenes.  
+
+```{r}
+#| code-summary: Aplicar función a la muestra
+fusionSample <- fusionL9(bands = multiSample,
+                         panchro = panchroSample)
+```
+
+```{r}
+#| echo: false
+#| label: fig-perso
+#| fig-cap: Comparación (a) muestra de la imagen en color real descargada directamente de Landsat-9 con resolución espacial de 30 metros; y (b) muestra de la imagen en color real fusionada a 15 metros con funsión personalizada
+par(mfrow = c(1,2), cex.main = 2)
+plotRGB(rast(multiSample), 4, 3, 2,  main = '\n a) Color real 30m', stretch = 'lin')
+plotRGB(rast(fusionSample), 4, 3, 2, main = '\n b) Color real 15m', stretch = 'lin')
+```
+
+
+
+
+
+
+
+
+
+:::
